@@ -3,62 +3,79 @@ from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from decimal import Decimal
 import requests
 import logging
-import pymongo
 import json
+from database.db import db
+from database.User import User
+from database.UserSocial import UserSocial
+from database.CoinInfo import CoinInfo
+from pprint import pprint
+from passlib.apps import custom_app_context as pwd_context
+from passlib.hash import sha256_crypt 
 
 config = json.loads(open("config.json").read())
+
+photon_rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
+						   (config['photon_rpc']['user'], config['photon_rpc']['password'],
+							config['photon_rpc']['host'], config['photon_rpc']['port']))
+blake_rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
+						   (config['blake_rpc']['user'], config['blake_rpc']['password'],
+							config['blake_rpc']['host'], config['blake_rpc']['port']))
+
+tickers = ['PHO', 'BLC']
 
 logging.basicConfig(
 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	level=logging.INFO)
 
 
-def get_mongo():
-	client = pymongo.MongoClient(config['mongo']['host'],
-								 config['mongo']['port'])
-	return client[config['mongo']['db']]
+def get_mysql():
+	return db
 
+def check_auth(email, password):
+	user = get_user(email)
+
+	return sha256_crypt.verify(password, user.password)
 
 def get_user_id(user):
-	db = get_mongo()
 
-	u = db.users.find_one({'username': user})
+	social_user = UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user)).get()
+	found_user = User.get(User.id == social_user.user_id)
+	return found_user
 
-	return u
 
-
-def get_user(user):
-	db = get_mongo()
-
-	u = db.users.find_one({'userid': user})
-
-	if u is None:
-		u = {'userid': user}
-		db.users.insert(u)
-
-	return u
+def get_user(email):
+	return User.select().where(User.email == email).get()
 
 
 def add_to_chat(user, chat):
-	db = get_mongo()
+	db = get_mysql()
 
 	db.users.update({'userid': user['userid']}, {'$addToSet': {'chats': chat}})
 
 
-def is_registered(user):
-	db = get_mongo()
+def is_registered(email):
 
-	return db.users.count({'username': user}) != 0
+	# query the database to see if the telegram id is registered with any user
+
+
+	# if the telegram id is found return true
+
+	return User.select().where(User.email == email).get() is not None
 
 
 def is_registered_id(user):
-	db = get_mongo()
 
-	return db.users.count({'userid': user}) != 0
+	try:
+		return UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user)).get() != 0
+	except Exception as e:
+		return False
 
 
-def give_balance(user, amount):
-	db = get_mongo()
+def give_balance(user, amount, ticker):
+
+	social_user = UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user))
+	found_user = User.select().where(User.id == UserSocial.user_id)
+	coin_info = CoinInfo.select().where(CoinInfo.user_id == found_user.id)
 
 	db.users.update({'userid': user['userid']},
 					{'$inc': {'redeemed': float(-amount)}})
@@ -67,7 +84,7 @@ def give_balance(user, amount):
 
 
 def get_balance(user):
-	db = get_mongo()
+	db = get_mysql()
 
 	rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
 						   (config['rpc']['user'], config['rpc']['password'],
@@ -98,28 +115,39 @@ def validate_address(address):
 							config['rpc']['host'], config['rpc']['port']))
 	return rpc.validateaddress(address)['isvalid']
 
+def generate_address(ticker):
 
-def get_address(user):
-	db = get_mongo()
+	if ticker == 'PHO':
+		return photon_rpc.getnewaddress()
+	else:
+		return blake_rpc.getnewaddress()
 
-	address = db.users.find_one({'userid': user['userid']}) \
-				.get('address', None)
-
-	if address is None:
-		rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
-							   (config['rpc']['user'],
-								config['rpc']['password'],
-								config['rpc']['host'], config['rpc']['port']))
-		address = rpc.getnewaddress()
-		db.users.update({'userid': user['userid']},
-						{'$set': {'address': address}})
-
-	return address
+def get_address(user, ticker):
+	coininfo = None
+	#see if deposit info exists for user.
+	try:
+		coininfo = CoinInfo.get(CoinInfo.user_id == user.id)
+	except Exception as e:
+		print(e)
+	
+	if coininfo is None:
+		address_set = CoinInfo(photon_balance=0, blake_balance=0,photon_address=generate_address("PHO"), blake_address=generate_address("BLC"), user=user)
+		saved = address_set.save()
+		if saved > 0:
+			if ticker == "PHO":
+				return address_set.photon_address
+			else:
+				return address_set.blake_address
+	else:
+		if ticker == "PHO":
+			return coininfo.photon_address
+		else:
+			return coininfo.blake_address
 
 
 def start(bot, update):
-	update.message.reply_text('Hello! I\'m a tipbot for the RPICoin crypto. ' +
-							  'Add me to a group and start tipping!')
+	update.message.reply_text('Hello! I\'m a tipbot for the Blakezone Portal ' +
+							  'Add me to a group and start tipping! userid: ' + str(update.message.from_user.id))
 
 	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
@@ -127,23 +155,29 @@ def start(bot, update):
 def tip(bot, update):
 	args = update.message.text.split()[1:]
 
-	if len(args) == 2:
+	if len(args) == 3:
 		# Unfortunatelly the only way i can currently think of for getting the
 		# user ID for the username is if I get the user to register first.
 		# Sucks, but I guess I need it to be done
-		user = get_user_id(args[0])
+
+		user = get_user_id(args[1])
 		from_user = get_user(update.message.from_user.id)
+		ticker
+
+
 		try:
-			amount = Decimal(args[1])
+			amount = Decimal(args[2])
 		except decimal.InvalidOperation:
-			update.message.reply_text("Usage: /tip <user> <amount>")
+			update.message.reply_text("Usage: /tip <ticker> <user> <amount>")
 			return
 
-		if user is not None:
+		if user is not None and from_user is not None:
 			if amount > 0:
 				if get_balance(from_user) - amount >= 0:
-					from_user = give_balance(from_user, -amount)
+
+					from_user = give_balance(from_user, -amount, )
 					user = give_balance(user, amount)
+
 					bot.sendMessage(chat_id=update.message.chat_id,
 									text="%s tipped %s %f RPI" % (
 										from_user['username'],
@@ -157,7 +191,7 @@ def tip(bot, update):
 		else:
 			update.message.reply_text("%s is not registered!" % (args[0]))
 	else:
-		update.message.reply_text("Usage: /tip <user> <amount>")
+		update.message.reply_text("Usage: /tip <ticker> <user> <amount>")
 
 	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
@@ -175,7 +209,7 @@ def soak(bot, update):
 
 		if amount > 0:
 			if get_balance(from_user) - amount >= 0:
-				db = get_mongo()
+				db = get_mysql()
 
 				users = db.users.find({'chats': update.message.chat_id,
 									   'userid': {'$ne': from_user['userid']},
@@ -238,41 +272,54 @@ def balance(bot, update):
 	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
 
+# this register function is now complient with photon
 def register(bot, update):
 	args = update.message.text.split()[1:]
 
-	if len(args) == 1:
-		username = args[0]
+	if len(args) == 2:
+		email = args[0]
+		password = args[1]
+
+		#check if someone already owns this telegram id
 
 		if not is_registered_id(update.message.from_user.id):
-			if not is_registered(username):
-				db = get_mongo()
 
-				db.users.insert_one({'username': username,
-									 'userid': update.message.from_user.id})
-				update.message.reply_text("You're now registered as %s!" %
-										  args[0])
-			else:
-				update.message.reply_text("Username is already in use!")
+			#if no one owns the telegram id, authenticate the user against the DB
+			#and link their blake zone account
+
+			if not is_registered(email):
+				update.message.reply_text("Please register at https://blakezone.com!")
+			try:
+				check_auth(email, password)
+				user = get_user(email)
+				social_user = UserSocial(social_id=update.message.from_user.id, social_name= 'telegram', social_username=update.message.from_user.username, user=user)
+				saved = social_user.save()  # save() returns the number of rows modified.
+				if saved > 0:
+					update.message.reply_text("This telegram account with username %s and user id %d \n has been connected to the blakezone account with email %s" % (update.message.from_user.username, update.message.from_user.id, user.email))
+				else:
+					update.message.reply_text("This telegram account is already connected to a blakezone account")
+			except Exception as e:
+				print(e)
+				update.message.reply_text("Your blakezone username or password is incorrect!")
 		else:
-			db = get_mongo()
-
-			db.users.update({'userid': update.message.from_user.id},
-							{'$set': {'username': username}})
-			update.message.reply_text("Your nick was updated to %s!" %
-									  args[0])
+			update.message.reply_text("This telegram account is already connected to a blakezone account")
 	else:
-		update.message.reply_text("Usage: /register <username>")
+		update.message.reply_text("Usage: /register <email> <password> \n Register is used to connect your telegram account to your blakezone account!")
 
-	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
+	# add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
 
 def deposit(bot, update):
-	update.message.reply_text(
-		"Your deposit address is %s" %
-		get_address(get_user(update.message.from_user.id)))
 
-	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
+	args = update.message.text.split()[1:]
+
+	if len(args) == 1:
+		if args[0] in tickers:
+				update.message.reply_text("Your deposit address is %s" % get_address(get_user_id(update.message.from_user.id), args[0]))
+	else:
+		update.message.reply_text("Usage: /deposit <ticker>")
+
+	# add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
 
 def withdraw(bot, update):
@@ -356,7 +403,7 @@ def market(bot, update):
 	request = requests.get('https://api.cryptonator.com/api/full/%s-%s' %
 						   (base, target))
 
-	ticker = request.json()?
+	ticker = request.json()
 
 	if ticker['success']:
 		price = Decimal(ticker['ticker']['price'])
@@ -380,6 +427,7 @@ def market(bot, update):
 
 
 if __name__ == "__main__":
+	db.create_tables([User, UserSocial, CoinInfo])
 	updater = Updater(config['token'])
 
 	updater.dispatcher.add_handler(CommandHandler('start', start))

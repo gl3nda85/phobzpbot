@@ -27,10 +27,6 @@ logging.basicConfig(
 	format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 	level=logging.INFO)
 
-
-def get_mysql():
-	return db
-
 def check_auth(email, password):
 	user = get_user(email)
 
@@ -47,10 +43,9 @@ def get_user(email):
 	return User.select().where(User.email == email).get()
 
 
-def add_to_chat(user, chat):
-	db = get_mysql()
+# def add_to_chat(user, chat):
 
-	db.users.update({'userid': user['userid']}, {'$addToSet': {'chats': chat}})
+	# db.users.update({'userid': user['userid']}, {'$addToSet': {'chats': chat}})
 
 
 def is_registered(email):
@@ -73,47 +68,64 @@ def is_registered_id(user):
 
 def give_balance(user, amount, ticker):
 
-	social_user = UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user))
-	found_user = User.select().where(User.id == UserSocial.user_id)
-	coin_info = CoinInfo.select().where(CoinInfo.user_id == found_user.id)
-
-	db.users.update({'userid': user['userid']},
-					{'$inc': {'redeemed': float(-amount)}})
-
-	return db.users.find_one({'userid': user['userid']})
+	social_user = UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user)).first()
+	found_user = User.select().where(User.id == social_user.user_id).first()
+	coin_info = CoinInfo.select().where(CoinInfo.user_id == found_user.id).first()
 
 
-def get_balance(user):
-	db = get_mysql()
+	if ticker == "PHO":
+		coin_info.photon_balance = coin_info.photon_balance - float(amount)
+	else:
+		coin_info.blake_balance = coin_info.blake_balance - float(amount)
 
-	rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
-						   (config['rpc']['user'], config['rpc']['password'],
-							config['rpc']['host'], config['rpc']['port']))
-	address = get_address(user)
+	coin_info.save()
+
+	return found_user
+
+
+def get_balance(user, ticker):
+
+	rpc = blake_rpc
+	if ticker == "PHO":
+		rpc = photon_rpc
+
+	social_user = UserSocial.select().where((UserSocial.social_name == 'telegram') & (UserSocial.social_id == user)).first()
+	found_user = User.select().where(User.id == social_user.user_id).first()
+	coin_info = CoinInfo.select().where(CoinInfo.user_id == found_user.id).get()
+	balance = None
+
+	address = get_address(found_user, ticker)
+
+	received = rpc.getreceivedbyaddress(address)
+
+	if ticker == "PHO":
+		balance = coin_info.photon_balance
+	else:
+		balance = coin_info.blake_balance
+
+
+	return received - Decimal(balance)
+
+
+def get_unconfirmed(user, ticker):
+
+	rpc = blake_rpc
+	if ticker == "PHO":
+		rpc = photon_rpc
+
+	address = get_address(user, ticker)
 
 	received = rpc.getreceivedbyaddress(address)
 
-	return received - Decimal(db.users.find_one(
-								{'userid': user['userid']}).get('redeemed', 0))
-
-
-def get_unconfirmed(user):
-	rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
-						   (config['rpc']['user'], config['rpc']['password'],
-							config['rpc']['host'], config['rpc']['port']))
-	address = get_address(user)
-
-	received = rpc.getreceivedbyaddress(address)
 	received_unconfirmed = rpc.getreceivedbyaddress(address, 0)
 
 	return received_unconfirmed - received
 
-
-def validate_address(address):
-	rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
-						   (config['rpc']['user'], config['rpc']['password'],
-							config['rpc']['host'], config['rpc']['port']))
-	return rpc.validateaddress(address)['isvalid']
+def validate_address(address, ticker):
+	if ticker == 'PHO':
+		return photon_rpc.validateaddress(address)['isvalid']
+	else:
+		return blake_rpc.validateaddress(address)['isvalid']
 
 def generate_address(ticker):
 
@@ -162,8 +174,6 @@ def tip(bot, update):
 
 		user = get_user_id(args[1])
 		from_user = get_user(update.message.from_user.id)
-		ticker
-
 
 		try:
 			amount = Decimal(args[2])
@@ -254,22 +264,48 @@ def soak(bot, update):
 
 
 def balance(bot, update):
-	bal = get_balance(get_user(update.message.from_user.id))
+	ticker_keys =	{
+	  "PHO": 175,
+	  "BLC": 125
+	}
 
-	r = requests.get('https://api.cryptonator.com/api/ticker/%s-%s' %
-					 ('ok', 'usd'))
-	usd = Decimal(bal)*Decimal(r.json()['ticker']['price'])
+	args = update.message.text.split()[1:]
 
-	unconfirmed = ""
+	if len(args) == 1:
+		args[0] = args[0].upper()
+		if args[0] in tickers:
 
-	if get_unconfirmed(get_user(update.message.from_user.id)) > 0:
-		unconfirmed = "(+ %s unconfirmed)" % \
-					  get_unconfirmed(get_user(update.message.from_user.id))
+			quote_page = requests.get('https://api.coinmarketcap.com/v2/ticker/'+ str(ticker_keys[args[0]])+'/?convert=ltc')
+			jsonResult = quote_page.json()
+			data = jsonResult['data']
+			ltcPrice = float(data['quotes']['LTC']['price'])
+			usdPrice = float(data['quotes']['USD']['price'])
+			user = update.message.from_user.id
+			username = update.message.from_user.username
+			if user is None:
+				bot.send_message(chat_id=update.message.chat_id, text="Please set a telegram username in your profile settings!")
+			else:
+				result  = get_balance(user, args[0])
+				balance  = float(result)
+				fiat_balance = balance * usdPrice
+				fiat_balance = str(round(fiat_balance,3))
+				ltc_balance = balance * ltcPrice
+				ltc_balance = str(round(ltc_balance,3))
+				balance =  str(round(balance,3))
+				unconfirmed = ""
 
-	update.message.reply_text("You have %s RPI (%f USD) %s" %
-							  (bal, usd, unconfirmed))
+				if get_unconfirmed(get_user_id(update.message.from_user.id), args[0]) > 0:
+					unconfirmed = "(+ %s unconfirmed)" % \
+								  get_unconfirmed(get_user_id(update.message.from_user.id), args[0])
 
-	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
+				bot.send_message(chat_id=update.message.chat_id, text="@{0} your current balance is: {1} {2} ≈ ${3} or {4} LTC {5}".format(username, args[0], balance,fiat_balance, ltc_balance, unconfirmed))
+		else:
+			update.message.reply_text("ticker not found")
+
+	else:
+		update.message.reply_text("Usage: /balance <ticker>")
+
+	# add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
 
 # this register function is now complient with photon
@@ -314,6 +350,7 @@ def deposit(bot, update):
 	args = update.message.text.split()[1:]
 
 	if len(args) == 1:
+		args[0] = args[0].upper()
 		if args[0] in tickers:
 				update.message.reply_text("Your deposit address is %s" % get_address(get_user_id(update.message.from_user.id), args[0]))
 	else:
@@ -323,38 +360,42 @@ def deposit(bot, update):
 
 
 def withdraw(bot, update):
-	bal = get_balance(get_user(update.message.from_user.id))
+
 
 	args = update.message.text.split()[1:]
 
-	if len(args) == 2:
+	if len(args) == 3:
 		try:
-			amount = Decimal(args[1])
+			amount = Decimal(args[2])
 		except decimal.InvalidOperation:
-			update.message.reply_text("Usage: /withdraw <address> <amount>")
+			update.message.reply_text("Usage: /withdraw <address> <ticker> <amount>")
 			return
+		args[1] = args[1].upper()
+		bal = get_balance(update.message.from_user.id, args[1])
 		if bal - amount >= 0 and amount > 1:
-			if validate_address(args[0]):
-				rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
-									   (config['rpc']['user'],
-										config['rpc']['password'],
-										config['rpc']['host'],
-										config['rpc']['port']))
+			if validate_address(args[0], args[1]):
+
+				rpc = blake_rpc
+
+				if args[1] == "PHO":
+					rpc = photon_rpc
+
 				rpc.settxfee(0.5)
-				txid = rpc.sendtoaddress(args[0], amount-1)
-				give_balance(get_user(update.message.from_user.id), -amount)
+				txid = rpc.sendtoaddress(args[0], amount - 1)
+
+				give_balance(update.message.from_user.id, -amount, args[1])
 				update.message.reply_text(
 					"Withdrew %f RPI! TX: %s" %
-					(amount-1, "https://explorer.rpicoin.com/tx/" + txid))
+					(amount-1, "https://chainz.cryptoid.info/pho/tx.dws?" + str(txid)))
 			else:
 				update.message.reply_text("Invalid address")
 		else:
 			update.message.reply_text("amount has to be more than 1, and " +
 									  "you need to have enough RPI Coins")
 	else:
-		update.message.reply_text("Usage: /withdraw <address> <amount>")
+		update.message.reply_text("Usage: /withdraw <address> <ticker> <amount>")
 
-	add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
+	# add_to_chat(get_user(update.message.from_user.id), update.message.chat_id)
 
 
 def convert(bot, update):

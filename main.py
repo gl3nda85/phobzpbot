@@ -214,7 +214,7 @@ def tip(bot, update):
 					user = give_balance(user.social_id, amount, ticker)
 
 					bot.sendMessage(chat_id=update.message.chat_id,
-									text="%s tipped %s %f %s" % (
+									text="%s tipped %s %s %f" % (
 										from_user.social_username,
 										user.social_username,
 										ticker,

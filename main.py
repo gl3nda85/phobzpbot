@@ -235,32 +235,32 @@ def tip(bot, update):
 def soak(bot, update):
 	args = update.message.text.split()[1:]
 
-	if len(args) == 1:
+	if len(args) == 2:
 		from_user = get_social_user_from_id(update.message.from_user.id)
+		ticker = args[1].upper()
 		try:
-			amount = Decimal(args[0])
+			amount = Decimal(args[1])
 		except decimal.InvalidOperation:
-			update.message.reply_text("Usage: /soak <amount>")
+			update.message.reply_text("Usage: /soak <ticker> <amount>")
 			return
 
 		if amount > 0:
-			if get_balance(from_user) - amount >= 0:
-				db = get_mysql()
+			if get_balance(from_user, ticker) - amount >= 0:
 
-				users = db.users.find({'chats': update.message.chat_id,
-									   'userid': {'$ne': from_user['userid']},
-									   'username': {'$ne': None}})
+				# grab most active users that have interated with the bot
+
+				users = (UserSocial.select().where(UserSocial.updated_at >= datetime.date())).get()
 
 				if users.count() > 0:
 					tip = amount/users.count()
-					from_user = give_balance(from_user, -amount)
+					from_user = give_balance(from_user.social_id, -amount)
 
 					usernames = []
 
 					for user in users:
 						print(user)
 						give_balance(user, tip)
-						usernames.append(user['username'])
+						usernames.append(user.social_username)
 
 					users_str = ", ".join(usernames)
 
@@ -268,11 +268,12 @@ def soak(bot, update):
 
 					for user in users:
 						print(user)
-						give_balance(user, tip)
+						give_balance(user.social_id, tip)
 
 					bot.sendMessage(chat_id=update.message.chat_id,
-									text="%s soaked %f RPI to %s!" % (
-										from_user['username'],
+									text="%s soaked %f %s to %s!" % (
+										from_user.social_username,
+										ticker,
 										tip,
 										users_str
 									))
@@ -284,7 +285,7 @@ def soak(bot, update):
 		else:
 			update.message.reply_text("Invalid amount")
 	else:
-		update.message.reply_text("Usage: /soak <amount>")
+		update.message.reply_text("Usage: /soak <ticker> <amount>")
 
 	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
 

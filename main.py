@@ -1,5 +1,6 @@
 from telegram.ext import Updater, CommandHandler
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
+from datetime import datetime, timedelta
 from decimal import Decimal
 import requests
 import logging
@@ -14,10 +15,13 @@ from passlib.hash import sha256_crypt
 
 config = json.loads(open("config.json").read())
 
-photon_rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
+rpc_providers = {}
+
+
+rpc_providers['PHO'] = AuthServiceProxy("http://%s:%s@%s:%d" %
 						   (config['photon_rpc']['user'], config['photon_rpc']['password'],
 							config['photon_rpc']['host'], config['photon_rpc']['port']))
-blake_rpc = AuthServiceProxy("http://%s:%s@%s:%d" %
+rpc_providers['BLC'] = AuthServiceProxy("http://%s:%s@%s:%d" %
 						   (config['blake_rpc']['user'], config['blake_rpc']['password'],
 							config['blake_rpc']['host'], config['blake_rpc']['port']))
 
@@ -67,11 +71,6 @@ def get_coininfo_from_user(user):
 	except Exception as e:
 		print(e)
 		return None
-	
-# def add_to_chat(user, chat):
-
-	# db.users.update({'userid': user['userid']}, {'$addToSet': {'chats': chat}})
-
 
 def is_registered(email):
 
@@ -82,7 +81,6 @@ def is_registered(email):
 
 	return User.select().where(User.email == email).get() is not None
 
-
 def is_registered_id(social_id):
 
 	try:
@@ -90,13 +88,15 @@ def is_registered_id(social_id):
 	except Exception as e:
 		return False
 
+def update_active_user(social_user):
+	social_user.updated_at = datetime.now()
+	return social_user.save() > 1
 
 def give_balance(social_id, amount, ticker):
 
 	social_user = get_social_user_from_id(social_id)
 	found_user = find_user_by_id(social_user.user_id)
 	coin_info = get_coininfo_from_user(found_user)
-
 
 	if ticker == "PHO":
 		coin_info.photon_balance = coin_info.photon_balance - amount
@@ -107,32 +107,32 @@ def give_balance(social_id, amount, ticker):
 
 	return social_user
 
-
 def get_balance(social_id, ticker):
 
-	rpc = photon_rpc if ticker == "PHO" else blake_rpc
+	rpc = rpc_providers[ticker.upper()]
 
 	social_user = get_social_user_from_id(social_id)
 	found_user = find_user_by_id(social_user.user_id)
 	coin_info = get_coininfo_from_user(found_user)
 	balance = None
 
+	print(tickers)
 	address = get_address(found_user, ticker)
-
+	print(address)
 	received = rpc.getreceivedbyaddress(address)
+	print(received)
 
 	if ticker == "PHO":
 		balance = coin_info.photon_balance
 	else:
 		balance = coin_info.blake_balance
 
-
 	return received - Decimal(balance)
-
 
 def get_unconfirmed(social_user, ticker):
 
-	rpc = photon_rpc if ticker == "PHO" else blake_rpc
+	rpc = rpc_providers[ticker.upper()]
+
 	address = get_address(find_user_by_id(social_user.user_id), ticker)
 
 	received = rpc.getreceivedbyaddress(address)
@@ -142,20 +142,14 @@ def get_unconfirmed(social_user, ticker):
 	return received_unconfirmed - received
 
 def validate_address(address, ticker):
-	if ticker == 'PHO':
-		return photon_rpc.validateaddress(address)['isvalid']
-	else:
-		return blake_rpc.validateaddress(address)['isvalid']
+	return rpc_providers[ticker.upper()].validateaddress(address)['isvalid']
 
 def generate_address(ticker):
-
-	if ticker == 'PHO':
-		return photon_rpc.getnewaddress()
-	else:
-		return blake_rpc.getnewaddress()
+	return rpc_providers[ticker.upper()].getnewaddress()
 
 def get_address(user, ticker):
 	coininfo = None
+	ticker = ticker.upper()
 	#see if deposit info exists for user.
 	try:
 		coininfo = CoinInfo.get(CoinInfo.user_id == user.id)
@@ -180,26 +174,20 @@ def generate_coin_info(user):
 	address_set = CoinInfo(photon_balance=0, blake_balance=0,photon_address=generate_address("PHO"), blake_address=generate_address("BLC"), user=user)
 	saved = address_set.save()
 	return saved
+
 def start(bot, update):
 	update.message.reply_text('Hello! I\'m a tipbot for the Blakezone Portal ' +
 							  'Add me to a group and start tipping!')
 
 	# add_to_chat(get_social_user_from_id(update.message.from_user.id), update.message.chat_id)
 
-
 def tip(bot, update):
 	args = update.message.text.split()[1:]
 
 	if len(args) == 3:
-		# Unfortunatelly the only way i can currently think of for getting the
-		# user ID for the username is if I get the user to register first.
-		# Sucks, but I guess I need it to be done
-		print(args[0])
 		user = get_social_user_from_username(args[0])
 		from_user = get_social_user_from_id(update.message.from_user.id)
 		ticker = args[1].upper()
-		pprint(user)
-		pprint(from_user)
 		try:
 			amount = Decimal(args[2])
 		except decimal.InvalidOperation:
@@ -220,6 +208,8 @@ def tip(bot, update):
 										ticker,
 										amount
 									))
+					update_active_user(from_user)
+					update_active_user(user)
 				else:
 					update.message.reply_text("Not enough money!")
 			else:
@@ -229,15 +219,12 @@ def tip(bot, update):
 	else:
 		update.message.reply_text("Usage: /tip <user> <ticker> <amount>")
 
-	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
-
 def soak(bot, update):
 	args = update.message.text.split()[1:]
 
 	if len(args) == 2:
 		from_user = get_social_user_from_id(update.message.from_user.id)
-		ticker = args[1].upper()
+		ticker = args[0].upper()
 		try:
 			amount = Decimal(args[1])
 		except decimal.InvalidOperation:
@@ -245,33 +232,29 @@ def soak(bot, update):
 			return
 
 		if amount > 0:
-			if get_balance(from_user, ticker) - amount >= 0:
+			if get_balance(from_user.social_id, ticker) - amount >= 0:
 
 				# grab most active users that have interated with the bot
-
-				users = (UserSocial.select().where(UserSocial.updated_at >= datetime.date())).get()
-
-				if users.count() > 0:
-					tip = amount/users.count()
-					from_user = give_balance(from_user.social_id, -amount)
+				last_hour_date_time = datetime.now() - timedelta(hours = 1)
+				users = (UserSocial.select().where((UserSocial.updated_at >= last_hour_date_time) & (UserSocial.social_id != from_user.social_id)))
+				result_length = len(list(users))
+				if result_length > 0:
+					tip = amount/result_length
+					from_user = give_balance(from_user.social_id, -amount, ticker)
 
 					usernames = []
 
 					for user in users:
-						print(user)
-						give_balance(user, tip)
-						usernames.append(user.social_username)
+						pprint(user)
+						give_balance(user.social_id, tip, ticker)
+						update_active_user(user)
+						usernames.append(str("@") + user.social_username)
 
 					users_str = ", ".join(usernames)
 
-					print(users.count())
-
-					for user in users:
-						print(user)
-						give_balance(user.social_id, tip)
-
+					update_active_user(from_user)
 					bot.sendMessage(chat_id=update.message.chat_id,
-									text="%s soaked %f %s to %s!" % (
+									text="%s soaked %s %f to %s!" % (
 										from_user.social_username,
 										ticker,
 										tip,
@@ -288,7 +271,6 @@ def soak(bot, update):
 		update.message.reply_text("Usage: /soak <ticker> <amount>")
 
 	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
 
 def balance(bot, update):
 	ticker_keys =	{
@@ -322,8 +304,7 @@ def balance(bot, update):
 				balance =  str(round(balance,3))
 				unconfirmed = ""
 
-				
-				print(social_user)
+				update_active_user(social_user)
 				if get_unconfirmed(social_user, args[0]) > 0:
 					unconfirmed = "(+ %s unconfirmed)" % \
 								  get_unconfirmed(social_user, args[0])
@@ -335,10 +316,6 @@ def balance(bot, update):
 	else:
 		update.message.reply_text("Usage: /balance <ticker>")
 
-	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
-
-# this register function is now complient with photon
 def register(bot, update):
 	args = update.message.text.split()[1:]
 
@@ -373,25 +350,22 @@ def register(bot, update):
 	else:
 		update.message.reply_text("Usage: /register <email> <password> \n Register is used to connect your telegram account to your blakezone account!")
 
-	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
+	update_active_user(social_user)
 
 def deposit(bot, update):
-
 	args = update.message.text.split()[1:]
-
+	social_user = get_social_user_from_id(update.message.from_user.id)
 	if len(args) == 1:
-		args[0] = args[0].upper()
-		if args[0] in tickers:
-				update.message.reply_text("Your deposit address is %s" % get_address(get_social_user_from_id(update.message.from_user.id), args[0]))
+		ticker = args[0].upper()
+		if ticker in tickers:
+			update.message.reply_text("Your deposit address is %s" % get_address(find_user_by_id(social_user.user_id), ticker))
+		else:
+			update.message.reply_text("something went wrong!")
 	else:
 		update.message.reply_text("Usage: /deposit <ticker>")
-
-	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
+	update_active_user(social_user)
 
 def withdraw(bot, update):
-
 
 	args = update.message.text.split()[1:]
 
@@ -401,23 +375,22 @@ def withdraw(bot, update):
 		except decimal.InvalidOperation:
 			update.message.reply_text("Usage: /withdraw <address> <ticker> <amount>")
 			return
-		args[1] = args[1].upper()
 		bal = get_balance(update.message.from_user.id, args[1])
+		ticker = args[1].upper()
 		if bal - amount >= 0 and amount > 1:
 			if validate_address(args[0], args[1]):
 
-				rpc = blake_rpc
-
-				if args[1] == "PHO":
-					rpc = photon_rpc
+				rpc = rpc_providers[ticker]
 
 				rpc.settxfee(0.5)
 				txid = rpc.sendtoaddress(args[0], amount - 1)
 
-				give_balance(update.message.from_user.id, -amount, args[1])
+				social_user = get_social_user_from_id(update.message.from_user.id)
+				give_balance(social_user.social_id, -amount, args[1])
+				update_active_user(social_user)
 				update.message.reply_text(
-					"Withdrew %f RPI! TX: %s" %
-					(amount-1, "https://chainz.cryptoid.info/pho/tx.dws?" + str(txid)))
+					"Withdrew %f %s! TX: %s" %
+					(amount-1,ticker, "https://chainz.cryptoid.info/pho/tx.dws?" + str(txid)))
 			else:
 				update.message.reply_text("Invalid address")
 		else:
@@ -425,9 +398,6 @@ def withdraw(bot, update):
 									  "you need to have enough RPI Coins")
 	else:
 		update.message.reply_text("Usage: /withdraw <address> <ticker> <amount>")
-
-	# add_to_chat(get_user_from_email(update.message.from_user.id), update.message.chat_id)
-
 
 def convert(bot, update):
 	args = update.message.text.split()[1:]
